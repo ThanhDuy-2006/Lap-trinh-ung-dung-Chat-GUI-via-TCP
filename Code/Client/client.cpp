@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstring>
+#include "../Shared/Protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -40,18 +41,21 @@ int main() {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         cout << "Socket creation failed!\n";
+        WSACleanup();
         return 1;
     }
 
-    // Cấu hình server
+    // Cấu hình server (cùng PORT với Protocol.h / server)
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(8888);
+    serverAddr.sin_port = htons(static_cast<u_short>(PORT));
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
 
     // Kết nối server
-    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
         cout << "Connection failed!\n";
+        closesocket(sock);
+        WSACleanup();
         return 1;
     }
 
