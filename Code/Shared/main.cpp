@@ -1,11 +1,9 @@
-#include <iostream>
 #include "Protocol.h"
 using namespace std;
+const string ENCODING = "ASCII";
+const string ENDLINE = "\n";
 
-int main()
+string formatMessage(const string& username, const string& message)
 {
-    cout << "PORT: " << PORT << endl;
-    cout << "ENCODING: " << ENCODING << endl;
-    cout << formatMessage("Duoc", "Hello");
-    return 0;
+    return "[" + username + "]: " + message + ENDLINE;
 }
