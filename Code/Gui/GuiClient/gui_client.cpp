@@ -6,8 +6,11 @@
 #include <ws2tcpip.h>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <codecvt>
 #include <msclr/marshal_cppstd.h>
 #include "../../Shared/Protocol.h"
+
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -22,7 +25,7 @@ private:
     // UI Components
     Panel^ loginPanel;
     Panel^ chatPanel;
-    
+
     // Login UI
     TextBox^ txtUsername;
     TextBox^ txtServerIp;
@@ -55,6 +58,16 @@ public:
     }
 
 private:
+    void OnHistoryClick(Object^ sender, EventArgs^ e) {
+        if (!isConnected) return;
+
+        String^ req = "/history"; // command gửi server
+        cli::array<unsigned char>^ bytes = System::Text::Encoding::UTF8->GetBytes(req);
+
+        pin_ptr<unsigned char> p = &bytes[0];
+        send(g_sock, (const char*)p, bytes->Length, 0);
+    }
+
     void InitializeComponent() {
         this->Text = "TCP Chat Application (WinForms)";
         this->Size = System::Drawing::Size(800, 600);
@@ -67,7 +80,7 @@ private:
         // --- Login Panel ---
         loginPanel = gcnew Panel();
         loginPanel->Dock = DockStyle::Fill;
-        
+
         Label^ lblTitle = gcnew Label();
         lblTitle->Text = "TCP CHAT CLIENT";
         lblTitle->Font = gcnew System::Drawing::Font("Segoe UI Semibold", 20);
@@ -141,6 +154,16 @@ private:
         chatPanel->Controls->Add(lblOnlineStatus);
 
         btnDisconnect = gcnew Button();
+        Button^ btnHistory;
+
+        btnHistory = gcnew Button();
+        btnHistory->Text = "Lịch sử";
+        btnHistory->Location = Point(550, 10);
+        btnHistory->Size = System::Drawing::Size(100, 30);
+        btnHistory->FlatStyle = FlatStyle::Flat;
+        btnHistory->BackColor = Color::FromArgb(100, 100, 100);
+        btnHistory->Click += gcnew EventHandler(this, &ChatForm::OnHistoryClick);
+        chatPanel->Controls->Add(btnHistory);
         btnDisconnect->Text = "Đăng xuất";
         btnDisconnect->Location = Point(670, 10);
         btnDisconnect->Size = System::Drawing::Size(100, 30);
@@ -187,6 +210,12 @@ private:
         rtbLog->AppendText("[" + DateTime::Now.ToString("HH:mm:ss") + "] " + msg + "\n");
         rtbLog->SelectionStart = rtbLog->TextLength;
         rtbLog->ScrollToCaret();
+    }
+    void SaveMessageToFile(const std::string& msg) {
+        std::ofstream out("chat_history.txt", std::ios::app | std::ios::binary);
+        if (out.is_open()) {
+            out << msg << "\n";
+        }
     }
 
     void AddMessage(String^ msg) {
@@ -245,7 +274,7 @@ private:
             cli::array<unsigned char>^ bytes = gcnew cli::array<unsigned char>(b);
             System::Runtime::InteropServices::Marshal::Copy(IntPtr(buf), bytes, 0, b);
             String^ rawStr = System::Text::Encoding::UTF8->GetString(bytes);
-            
+
             String^ managedMsg = "";
             String^ systemPrefix = msclr::interop::marshal_as<String^>(SYSTEM_PREFIX);
             String^ fromPrefix = msclr::interop::marshal_as<String^>(FROM_PREFIX);
@@ -258,7 +287,25 @@ private:
                 }
             }
             else if (rawStr->StartsWith(systemPrefix)) {
-                managedMsg = "[Hệ thống] " + rawStr->Substring(systemPrefix->Length);
+                String^ content = rawStr->Substring(systemPrefix->Length);
+
+                if (content->StartsWith("[HISTORY]")) {
+                    String^ hist = content->Substring(9)->Trim();
+
+                    if (hist->StartsWith("FROM|")) {
+                        String^ p = hist->Substring(5);
+                        int d = p->IndexOf("|");
+                        if (d != -1) {
+                            managedMsg = "[Lịch sử] " + p->Substring(0, d) + ": " + p->Substring(d + 1);
+                        }
+                    }
+                    else {
+                        managedMsg = "[Lịch sử] " + hist;
+                    }
+                }
+                else {
+                    managedMsg = "[Hệ thống] " + content;
+                }
             }
             else {
                 managedMsg = rawStr;
@@ -320,7 +367,7 @@ private:
         }
 
         this->BeginInvoke(gcnew Action(this, &ChatForm::SwitchToChat));
-        
+
         receiveThread = gcnew Thread(gcnew ThreadStart(this, &ChatForm::ReceiveLoop));
         receiveThread->Start();
     }
