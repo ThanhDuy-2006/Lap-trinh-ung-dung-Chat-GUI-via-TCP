@@ -1,390 +1,459 @@
-#include <iostream>
-#include <thread>
+#using <System.dll>
+#using <System.Drawing.dll>
+#using <System.Windows.Forms.dll>
+
+#include <winsock2.h>
+#include <fcntl.h>
+#include <io.h>
+#include <ws2tcpip.h>
+#include <string>
+#include <vector>
 #include <mutex>
 #include <unordered_map>
-#include <atomic>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <cstring>
 #include <cctype>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <chrono>
-#include <windows.h>
+#include <msclr/marshal_cppstd.h>
+#include <msclr/lock.h>
 #include "../Shared/Protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
-using namespace std;
+using namespace System;
+using namespace System::Windows::Forms;
+using namespace System::Drawing;
+using namespace System::Threading;
+using namespace System::IO;
 
-struct ClientInfo {
-    int id = 0;
-    string name;
-    SOCKET socket = INVALID_SOCKET;
-};
-
-unordered_map<SOCKET, ClientInfo> clients;
-mutex clientsMutex;
-atomic<int> nextClientId{1};
-mutex logMutex;
-string activityLogPath;
-void broadcast(const string& msg, SOCKET excludedSocket = INVALID_SOCKET);
-
-bool startsWith(const string& text, const string& prefix) {
-    return text.rfind(prefix, 0) == 0;
-}
-
-string getCurrentTimestamp() {
-    auto now = chrono::system_clock::now();
-    time_t currentTime = chrono::system_clock::to_time_t(now);
-    tm localTime{};
-    localtime_s(&localTime, &currentTime);
-
-    stringstream ss;
-    ss << put_time(&localTime, "%Y-%m-%d %H:%M:%S");
-    return ss.str();
-}
-
-string getExecutableDirectory() {
-    char modulePath[MAX_PATH] = {0};
-    DWORD length = GetModuleFileNameA(nullptr, modulePath, MAX_PATH);
-    if (length == 0 || length == MAX_PATH) {
-        return ".";
-    }
-    string fullPath(modulePath);
-    size_t separator = fullPath.find_last_of("\\/");
-    if (separator == string::npos) {
-        return ".";
-    }
-    return fullPath.substr(0, separator);
-}
-
-void logRealtime(const string& eventText) {
-    const string line = "[" + getCurrentTimestamp() + "] " + eventText;
-    lock_guard<mutex> lock(logMutex);
-
-    cout << line << endl;
-    if (!activityLogPath.empty()) {
-        ofstream out(activityLogPath, ios::app);
-        if (out.is_open()) {
-            out << line << "\n";
-        }
-    }
-}
-
-string trim(const string& value) {
+static std::string trimNative(const std::string& value) {
     size_t start = 0;
-    while (start < value.size() && isspace(static_cast<unsigned char>(value[start]))) {
+    while (start < value.size() && isspace(static_cast<unsigned char>(value[start])))
         ++start;
-    }
-
     size_t end = value.size();
-    while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) {
+    while (end > start && isspace(static_cast<unsigned char>(value[end - 1])))
         --end;
-    }
-
     return value.substr(start, end - start);
 }
 
-string sanitizeUsername(const string& rawName) {
-    string input = trim(rawName);
-    string result;
+static std::string sanitizeUsername(const std::string& rawName) {
+    std::string input = trimNative(rawName);
+    std::string result;
     result.reserve(input.size());
 
     for (char ch : input) {
         unsigned char c = static_cast<unsigned char>(ch);
-        if (isalnum(c) || ch == '_' || ch == '-' || ch == '.') {
+        if (isalnum(c) || ch == '_' || ch == '-' || ch == '.')
             result.push_back(ch);
-        }
     }
 
-    if (result.empty()) {
-        result = "guest";
-    }
-
-    if (result.size() > static_cast<size_t>(MAX_USERNAME_LENGTH)) {
+    if (result.empty()) result = "guest";
+    if (result.size() > static_cast<size_t>(MAX_USERNAME_LENGTH))
         result.resize(MAX_USERNAME_LENGTH);
-    }
-
     return result;
 }
 
-bool usernameExistsLocked(const string& name) {
-    for (const auto& entry : clients) {
-        if (entry.second.name == name) {
-            return true;
-        }
-    }
-    return false;
-}
-
-string buildUniqueUsernameLocked(const string& requestedName) {
-    string baseName = sanitizeUsername(requestedName);
-    if (!usernameExistsLocked(baseName)) {
-        return baseName;
-    }
-
-    for (int suffix = 2;; ++suffix) {
-        string suffixText = "#" + to_string(suffix);
-        string candidateBase = baseName;
-        if (suffixText.size() >= static_cast<size_t>(MAX_USERNAME_LENGTH)) {
-            candidateBase.clear();
-            suffixText = suffixText.substr(0, static_cast<size_t>(MAX_USERNAME_LENGTH));
-        } else if (candidateBase.size() + suffixText.size() > static_cast<size_t>(MAX_USERNAME_LENGTH)) {
-            size_t allowedBaseLength = static_cast<size_t>(MAX_USERNAME_LENGTH) - suffixText.size();
-            candidateBase = candidateBase.substr(0, allowedBaseLength);
-        }
-
-        string candidate = candidateBase + suffixText;
-        if (!usernameExistsLocked(candidate)) {
-            return candidate;
-        }
-    }
-}
-
-void sendToClient(SOCKET clientSocket, const string& payload) {
-    send(clientSocket, payload.c_str(), static_cast<int>(payload.size()), 0);
-}
-
-string buildOnlineSummaryLocked() {
-    if (clients.empty()) {
-        return "Online (0): none";
-    }
-
-    string summary = "Online (" + to_string(clients.size()) + "): ";
-    bool first = true;
-    for (const auto& entry : clients) {
-        if (!first) {
-            summary += ", ";
-        }
-        first = false;
-        summary += entry.second.name + "(#" + to_string(entry.second.id) + ")";
-    }
-    return summary;
-}
-
-string getOnlineSummary() {
-    lock_guard<mutex> lock(clientsMutex);
-    return buildOnlineSummaryLocked();
-}
-
-void broadcastOnlineSummary() {
-    const string summary = getOnlineSummary();
-    const string payload = string(SYSTEM_PREFIX) + summary;
-    broadcast(payload, INVALID_SOCKET);
-    logRealtime(summary);
-}
-
-string getRemoteEndpoint(SOCKET clientSocket) {
+static std::string getRemoteEndpoint(SOCKET clientSocket) {
     sockaddr_in addr{};
     int addrLen = sizeof(addr);
-    if (getpeername(clientSocket, reinterpret_cast<sockaddr*>(&addr), &addrLen) == SOCKET_ERROR) {
+    if (getpeername(clientSocket, reinterpret_cast<sockaddr*>(&addr), &addrLen) == SOCKET_ERROR)
         return "unknown";
-    }
 
-    char ipBuffer[INET_ADDRSTRLEN] = {0};
-    if (inet_ntop(AF_INET, &addr.sin_addr, ipBuffer, sizeof(ipBuffer)) == nullptr) {
+    char ipBuf[INET_ADDRSTRLEN] = {0};
+    if (inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf)) == nullptr)
         return "unknown";
-    }
 
-    return string(ipBuffer) + ":" + to_string(ntohs(addr.sin_port));
+    return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 }
 
-void runDiscoveryResponder() {
-    SOCKET discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (discoverySocket == INVALID_SOCKET) {
-        cout << "Discovery socket creation failed!\n";
-        return;
+public ref class ServerForm : public Form {
+private:
+    RichTextBox^ rtbLog;
+    ListBox^ lbClients;
+    Label^ lblStatus;
+    Label^ lblClientCount;
+    Button^ btnToggle;
+    Button^ btnClearHistory;
+
+    SOCKET serverSocket;
+    SOCKET discoverySocket;
+    bool isRunning;
+    std::unordered_map<SOCKET, int>* clientMap;
+    std::unordered_map<SOCKET, std::string>* clientNativeNames;
+    std::mutex* clientsMutex;
+
+    System::Collections::Concurrent::ConcurrentDictionary<int, String^>^ clientNames;
+    int nextId;
+    Thread^ acceptThread;
+    Thread^ discoveryThread;
+
+    String^ historyPath = "chat_history.txt";
+
+public:
+    ServerForm() {
+        serverSocket = INVALID_SOCKET;
+        discoverySocket = INVALID_SOCKET;
+        isRunning = false;
+        nextId = 1;
+        clientMap = new std::unordered_map<SOCKET, int>();
+        clientNativeNames = new std::unordered_map<SOCKET, std::string>();
+        clientsMutex = new std::mutex();
+        clientNames = gcnew System::Collections::Concurrent::ConcurrentDictionary<int, String^>();
+
+        InitializeComponent();
+        WSADATA wsa;
+        (void)WSAStartup(MAKEWORD(2, 2), &wsa);
     }
 
-    sockaddr_in discoveryAddr{};
-    discoveryAddr.sin_family = AF_INET;
-    discoveryAddr.sin_port = htons(static_cast<u_short>(DISCOVERY_PORT));
-    discoveryAddr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(discoverySocket, (sockaddr*)&discoveryAddr, sizeof(discoveryAddr)) == SOCKET_ERROR) {
-        cout << "Discovery bind failed!\n";
-        closesocket(discoverySocket);
-        return;
+    ~ServerForm() {
+        StopServer();
+        delete clientMap;
+        delete clientNativeNames;
+        delete clientsMutex;
+        WSACleanup();
     }
 
-    char buffer[256];
-    while (true) {
-        sockaddr_in clientAddr{};
-        int clientLen = sizeof(clientAddr);
-        int bytes = recvfrom(discoverySocket, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &clientLen);
-        if (bytes <= 0) {
-            continue;
+protected:
+    !ServerForm() { this->~ServerForm(); }
+
+private:
+    void InitializeComponent() {
+        this->Text = "TCP Chat Server - Management";
+        this->Size = System::Drawing::Size(900, 650);
+        this->BackColor = Color::FromArgb(25, 25, 25);
+        this->ForeColor = Color::White;
+        this->Font = gcnew System::Drawing::Font("Segoe UI", 10);
+        this->FormBorderStyle = System::Windows::Forms::FormBorderStyle::FixedSingle;
+        this->StartPosition = FormStartPosition::CenterScreen;
+
+        Label^ lblTitle = gcnew Label();
+        lblTitle->Text = "SERVER MANAGEMENT";
+        lblTitle->Font = gcnew System::Drawing::Font("Segoe UI Semibold", 18);
+        lblTitle->ForeColor = Color::FromArgb(0, 150, 250);
+        lblTitle->Location = Point(20, 20);
+        lblTitle->AutoSize = true;
+        this->Controls->Add(lblTitle);
+
+        lblStatus = gcnew Label();
+        lblStatus->Text = L"Trạng thái: ĐANG DỪNG";
+        lblStatus->ForeColor = Color::IndianRed;
+        lblStatus->Location = Point(20, 65);
+        lblStatus->AutoSize = true;
+        this->Controls->Add(lblStatus);
+
+        btnToggle = gcnew Button();
+        btnToggle->Text = L"BẮT ĐẦU SERVER";
+        btnToggle->Location = Point(700, 25);
+        btnToggle->Size = System::Drawing::Size(165, 45);
+        btnToggle->FlatStyle = FlatStyle::Flat;
+        btnToggle->BackColor = Color::FromArgb(0, 120, 215);
+        btnToggle->Click += gcnew EventHandler(this, &ServerForm::OnToggleClick);
+        this->Controls->Add(btnToggle);
+
+        btnClearHistory = gcnew Button();
+        btnClearHistory->Text = L"XÓA LỊCH SỬ FILE";
+        btnClearHistory->Location = Point(525, 25);
+        btnClearHistory->Size = System::Drawing::Size(165, 45);
+        btnClearHistory->FlatStyle = FlatStyle::Flat;
+        btnClearHistory->BackColor = Color::FromArgb(60, 60, 60);
+        btnClearHistory->Click += gcnew EventHandler(this, &ServerForm::OnClearHistoryClick);
+        this->Controls->Add(btnClearHistory);
+
+        rtbLog = gcnew RichTextBox();
+        rtbLog->Location = Point(20, 130);
+        rtbLog->Size = System::Drawing::Size(620, 460);
+        rtbLog->BackColor = Color::FromArgb(15, 15, 15);
+        rtbLog->ForeColor = Color::FromArgb(200, 200, 200);
+        rtbLog->ReadOnly = true;
+        this->Controls->Add(rtbLog);
+
+        lbClients = gcnew ListBox();
+        lbClients->Location = Point(655, 130);
+        lbClients->Size = System::Drawing::Size(210, 460);
+        lbClients->BackColor = Color::FromArgb(30, 30, 30);
+        lbClients->ForeColor = Color::LightGreen;
+        this->Controls->Add(lbClients);
+    }
+
+    void SaveMessageToFile(String^ msg) {
+        try {
+            File::AppendAllText(historyPath, msg + Environment::NewLine,
+                                System::Text::Encoding::UTF8);
         }
+        catch (Exception^ ex) { AddLog(L"Lỗi ghi file: " + ex->Message); }
+    }
 
-        buffer[bytes] = '\0';
-        if (string(buffer) == DISCOVERY_REQUEST) {
-            sendto(
-                discoverySocket,
-                DISCOVERY_RESPONSE,
-                static_cast<int>(strlen(DISCOVERY_RESPONSE)),
-                0,
-                (sockaddr*)&clientAddr,
-                clientLen
-            );
+    void OnClearHistoryClick(Object^ sender, EventArgs^ e) {
+        try {
+            if (File::Exists(historyPath)) {
+                File::Delete(historyPath);
+                AddLog(L"HỆ THỐNG: Đã xóa file lịch sử trò chuyện.");
+                MessageBox::Show(L"Đã xóa file chat_history.txt thành công!",
+                    L"Thông báo", MessageBoxButtons::OK, MessageBoxIcon::Information);
+            }
+            else {
+                MessageBox::Show(L"Không tìm thấy file lịch sử để xóa.",
+                    L"Thông báo", MessageBoxButtons::OK, MessageBoxIcon::Warning);
+            }
+        }
+        catch (Exception^ ex) {
+            MessageBox::Show(L"Không thể xóa file: " + ex->Message,
+                L"Lỗi", MessageBoxButtons::OK, MessageBoxIcon::Error);
         }
     }
-}
 
-bool removeClient(SOCKET s, ClientInfo& removedClient) {
-    lock_guard<mutex> lock(clientsMutex);
-    auto it = clients.find(s);
-    if (it == clients.end()) {
+    void AddLog(String^ msg) {
+        if (this->InvokeRequired) {
+            this->BeginInvoke(gcnew Action<String^>(this, &ServerForm::AddLog), msg);
+            return;
+        }
+        rtbLog->AppendText("[" + DateTime::Now.ToString("HH:mm:ss") + "] " + msg + "\n");
+        rtbLog->ScrollToCaret();
+    }
+
+    void UpdateClientList() {
+        if (this->InvokeRequired) {
+            this->BeginInvoke(gcnew Action(this, &ServerForm::UpdateClientList));
+            return;
+        }
+        lbClients->Items->Clear();
+        for each (auto pair in clientNames) lbClients->Items->Add(pair.Value);
+    }
+
+    bool UsernameExistsLocked(const std::string& name) {
+        for (auto const& [sock, n] : *clientNativeNames) {
+            if (n == name) return true;
+        }
         return false;
     }
-    removedClient = it->second;
-    clients.erase(it);
-    return true;
-}
 
-void broadcast(const string& msg, SOCKET excludedSocket) {
-    lock_guard<mutex> lock(clientsMutex);
-    for (const auto& entry : clients) {
-        SOCKET clientSocket = entry.first;
-        if (clientSocket != excludedSocket) {
-            send(clientSocket, msg.c_str(), static_cast<int>(msg.size()), 0);
+    std::string BuildUniqueUsernameLocked(const std::string& requestedName) {
+        std::string baseName = sanitizeUsername(requestedName);
+        if (!UsernameExistsLocked(baseName)) return baseName;
+
+        for (int suffix = 2;; ++suffix) {
+            std::string suffixText = "#" + std::to_string(suffix);
+            std::string candidateBase = baseName;
+            if (candidateBase.size() + suffixText.size() > static_cast<size_t>(MAX_USERNAME_LENGTH)) {
+                size_t allowed = static_cast<size_t>(MAX_USERNAME_LENGTH) - suffixText.size();
+                candidateBase = candidateBase.substr(0, allowed);
+            }
+            std::string candidate = candidateBase + suffixText;
+            if (!UsernameExistsLocked(candidate)) return candidate;
         }
     }
-}
 
-void handleClient(SOCKET clientSocket) {
-    char buffer[1024];
-    bool authenticated = false;
-    ClientInfo currentClient;
-
-    while (true) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes = recv(clientSocket, buffer, sizeof(buffer), 0);
-
-        if (bytes <= 0) {
-            if (authenticated) {
-                ClientInfo removedClient;
-                if (removeClient(clientSocket, removedClient)) {
-                    logRealtime("LOGOUT client=" + removedClient.name + " (#" + to_string(removedClient.id) + ")");
-                    broadcast(string(SYSTEM_PREFIX) + removedClient.name + " left the chat.", clientSocket);
-                    broadcastOnlineSummary();
+    void BroadcastOnlineSummary() {
+        String^ summary;
+        {
+            std::lock_guard<std::mutex> lock(*clientsMutex);
+            if (clientMap->empty()) {
+                summary = "Online (0)";
+            }
+            else {
+                summary = "Online (" + clientMap->size() + "): ";
+                bool first = true;
+                for each (auto pair in clientNames) {
+                    if (!first) summary += ", ";
+                    first = false;
+                    summary += pair.Value;
                 }
-            } else {
-                logRealtime("Client disconnected before authentication");
             }
-            break;
         }
+        Broadcast(msclr::interop::marshal_as<String^>(SYSTEM_PREFIX) + summary, INVALID_SOCKET);
+        AddLog(summary);
+    }
 
-        string msg(buffer, bytes);
+    void StartServer() {
+        serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<u_short>(PORT));
+        addr.sin_addr.s_addr = INADDR_ANY;
 
-        if (!authenticated) {
-            if (!startsWith(msg, AUTH_PREFIX)) {
-                sendToClient(clientSocket, string(SYSTEM_PREFIX) + "Please authenticate first.");
-                continue;
+        if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            AddLog(L"Bind thất bại! Có thể port đang bị chiếm.");
+            return;
+        }
+        listen(serverSocket, SOMAXCONN);
+
+        discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sockaddr_in daddr{};
+        daddr.sin_family = AF_INET;
+        daddr.sin_port = htons(static_cast<u_short>(DISCOVERY_PORT));
+        daddr.sin_addr.s_addr = INADDR_ANY;
+        bind(discoverySocket, (sockaddr*)&daddr, sizeof(daddr));
+
+        isRunning = true;
+        acceptThread = gcnew Thread(gcnew ThreadStart(this, &ServerForm::AcceptLoop));
+        acceptThread->Start();
+        discoveryThread = gcnew Thread(gcnew ThreadStart(this, &ServerForm::DiscoveryLoop));
+        discoveryThread->Start();
+
+        lblStatus->Text = L"Trạng thái: ĐANG CHẠY (Port " + PORT + ")";
+        lblStatus->ForeColor = Color::LightGreen;
+        btnToggle->Text = L"DỪNG SERVER";
+        btnToggle->BackColor = Color::IndianRed;
+        AddLog(L"Server đã khởi động trên TCP port " + PORT +
+               ", discovery UDP port " + DISCOVERY_PORT + ".");
+    }
+
+    void StopServer() {
+        isRunning = false;
+        if (serverSocket != INVALID_SOCKET) closesocket(serverSocket);
+        if (discoverySocket != INVALID_SOCKET) closesocket(discoverySocket);
+        {
+            std::lock_guard<std::mutex> lock(*clientsMutex);
+            for (auto const& [sock, id] : *clientMap) closesocket(sock);
+            clientMap->clear();
+            clientNativeNames->clear();
+            clientNames->Clear();
+        }
+        lblStatus->Text = L"Trạng thái: ĐANG DỪNG";
+        lblStatus->ForeColor = Color::IndianRed;
+        btnToggle->Text = L"BẮT ĐẦU SERVER";
+        btnToggle->BackColor = Color::FromArgb(0, 120, 215);
+        UpdateClientList();
+        AddLog(L"Server đã dừng.");
+    }
+
+    void AcceptLoop() {
+        while (isRunning) {
+            SOCKET cs = accept(serverSocket, NULL, NULL);
+            if (cs == INVALID_SOCKET) break;
+            AddLog("Client kết nối từ " +
+                   msclr::interop::marshal_as<String^>(getRemoteEndpoint(cs)) +
+                   ", chờ xác thực...");
+            Thread^ t = gcnew Thread(gcnew ParameterizedThreadStart(this, &ServerForm::HandleClient));
+            t->Start(cs);
+        }
+    }
+
+    void DiscoveryLoop() {
+        char buf[256];
+        while (isRunning) {
+            sockaddr_in caddr{};
+            int clen = sizeof(caddr);
+            int b = recvfrom(discoverySocket, buf, 255, 0, (sockaddr*)&caddr, &clen);
+            if (b > 0 && std::string(buf, b) == DISCOVERY_REQUEST) {
+                sendto(discoverySocket, DISCOVERY_RESPONSE,
+                       static_cast<int>(strlen(DISCOVERY_RESPONSE)),
+                       0, (sockaddr*)&caddr, clen);
             }
+        }
+    }
 
-            string requestedName = msg.substr(strlen(AUTH_PREFIX));
+    void HandleClient(Object^ socketObj) {
+        SOCKET s = (SOCKET)(unsigned __int64)socketObj;
+        char buf[1024];
+        int myId = 0;
+        String^ myName = "";
+        std::string nativeName;
 
+        String^ authPrefix = msclr::interop::marshal_as<String^>(AUTH_PREFIX);
+        String^ msgPrefix  = msclr::interop::marshal_as<String^>(MSG_PREFIX);
+
+        try {
+            while (isRunning) {
+                int b = recv(s, buf, 1023, 0);
+                if (b <= 0) break;
+
+                cli::array<unsigned char>^ bytes = gcnew cli::array<unsigned char>(b);
+                System::Runtime::InteropServices::Marshal::Copy(IntPtr(buf), bytes, 0, b);
+                String^ rawStr = System::Text::Encoding::UTF8->GetString(bytes);
+
+                if (rawStr->StartsWith(authPrefix)) {
+                    std::string requestedName = msclr::interop::marshal_as<std::string>(
+                        rawStr->Substring(authPrefix->Length));
+
+                    {
+                        std::lock_guard<std::mutex> lock(*clientsMutex);
+                        myId = nextId++;
+                        nativeName = BuildUniqueUsernameLocked(requestedName);
+                        myName = msclr::interop::marshal_as<String^>(nativeName)
+                                 + " (#" + myId + ")";
+                        (*clientMap)[s] = myId;
+                        (*clientNativeNames)[s] = nativeName;
+                        clientNames->TryAdd(myId, myName);
+                    }
+
+                    AddLog("LOGIN: " + myName + " từ " +
+                           msclr::interop::marshal_as<String^>(getRemoteEndpoint(s)));
+                    UpdateClientList();
+
+                    String^ welcomeMsg = msclr::interop::marshal_as<String^>(SYSTEM_PREFIX)
+                        + L"Chào mừng " + msclr::interop::marshal_as<String^>(nativeName)
+                        + L" đã tham gia!";
+                    Broadcast(welcomeMsg, INVALID_SOCKET);
+                    BroadcastOnlineSummary();
+                }
+                else if (rawStr->Trim() == "/history") {
+                    if (File::Exists(historyPath)) {
+                        cli::array<String^>^ lines = File::ReadAllLines(
+                            historyPath, System::Text::Encoding::UTF8);
+                        for each (String^ line in lines) {
+                            String^ histLine = msclr::interop::marshal_as<String^>(SYSTEM_PREFIX)
+                                + "[HISTORY] " + line + "\n";
+                            cli::array<unsigned char>^ bMsg =
+                                System::Text::Encoding::UTF8->GetBytes(histLine);
+                            pin_ptr<unsigned char> p = &bMsg[0];
+                            send(s, (const char*)p, bMsg->Length, 0);
+                        }
+                    }
+                    else {
+                        std::string noHis = std::string(SYSTEM_PREFIX)
+                            + "Chưa có lịch sử trò chuyện.\n";
+                        send(s, noHis.c_str(), (int)noHis.size(), 0);
+                    }
+                }
+                else if (rawStr->StartsWith(msgPrefix)) {
+                    String^ content = rawStr->Substring(msgPrefix->Length);
+                    String^ fullMsg = myName + ": " + content;
+                    SaveMessageToFile(fullMsg);
+                    AddLog("MSG from " + myName + ": " + content);
+
+                    String^ outgoing = msclr::interop::marshal_as<String^>(FROM_PREFIX)
+                        + myName + "|" + content;
+                    Broadcast(outgoing, s);
+                }
+            }
+        }
+        catch (Exception^ ex) { AddLog(L"Lỗi client: " + ex->Message); }
+
+        if (myId > 0) {
             {
-                lock_guard<mutex> lock(clientsMutex);
-                currentClient.id = nextClientId++;
-                currentClient.name = buildUniqueUsernameLocked(requestedName);
-                currentClient.socket = clientSocket;
-                clients[clientSocket] = currentClient;
+                std::lock_guard<std::mutex> lock(*clientsMutex);
+                clientMap->erase(s);
+                clientNativeNames->erase(s);
+                String^ dummy;
+                clientNames->TryRemove(myId, dummy);
             }
+            AddLog("LOGOUT: " + myName);
+            UpdateClientList();
 
-            authenticated = true;
-            sendToClient(
-                clientSocket,
-                string(SYSTEM_PREFIX) + "Connected as " + currentClient.name + " (#" + to_string(currentClient.id) + ")."
-            );
-            broadcast(string(SYSTEM_PREFIX) + currentClient.name + " joined the chat.", clientSocket);
-            logRealtime(
-                "LOGIN client=" + currentClient.name + " (#" + to_string(currentClient.id) + "), from " + getRemoteEndpoint(clientSocket)
-            );
-            broadcastOnlineSummary();
-            continue;
+            String^ leaveMsg = msclr::interop::marshal_as<String^>(SYSTEM_PREFIX)
+                + myName + L" đã thoát.";
+            Broadcast(leaveMsg, INVALID_SOCKET);
+            BroadcastOnlineSummary();
         }
+        closesocket(s);
+    }
 
-        if (!startsWith(msg, MSG_PREFIX)) {
-            sendToClient(clientSocket, string(SYSTEM_PREFIX) + "Invalid message format.");
-            continue;
+    void Broadcast(String^ msg, SOCKET excluded) {
+        cli::array<unsigned char>^ bytes = System::Text::Encoding::UTF8->GetBytes(msg + "\n");
+        pin_ptr<unsigned char> p = &bytes[0];
+        std::lock_guard<std::mutex> lock(*clientsMutex);
+        for (auto const& [sock, id] : *clientMap) {
+            if (sock != excluded) send(sock, (const char*)p, bytes->Length, 0);
         }
-
-        string body = trim(msg.substr(strlen(MSG_PREFIX)));
-        if (body.empty()) {
-            continue;
-        }
-
-        string outgoing = string(FROM_PREFIX) + currentClient.name + "|" + body;
-        logRealtime("MESSAGE " + currentClient.name + " (#" + to_string(currentClient.id) + "): " + body);
-        broadcast(outgoing, clientSocket);
     }
 
-    closesocket(clientSocket);
-}
-
-int main() {
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        cout << "WSAStartup failed!\n";
-        return 1;
+    void OnToggleClick(Object^ sender, EventArgs^ e) {
+        if (!isRunning) StartServer(); else StopServer();
     }
+};
 
-    const string exeDir = getExecutableDirectory();
-    activityLogPath = exeDir + "\\client_activity_log.txt";
-    {
-        ofstream createIfMissing(activityLogPath, ios::app);
-    }
-    logRealtime("SERVER_START listening on TCP " + to_string(PORT) + ", discovery UDP " + to_string(DISCOVERY_PORT));
-
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket == INVALID_SOCKET) {
-        cout << "Socket creation failed!\n";
-        WSACleanup();
-        return 1;
-    }
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(static_cast<u_short>(PORT));
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        cout << "Bind failed!\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
-        cout << "Listen failed!\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    logRealtime("Server started on port " + to_string(PORT));
-    logRealtime("LAN discovery active on UDP port " + to_string(DISCOVERY_PORT));
-
-    thread discoveryThread(runDiscoveryResponder);
-    discoveryThread.detach();
-
-    while (true) {
-        SOCKET clientSocket = accept(serverSocket, NULL, NULL);
-
-        if (clientSocket == INVALID_SOCKET) {
-            logRealtime("Accept failed");
-            continue;
-        }
-
-        logRealtime("Client connected, waiting for authentication...");
-
-        thread t(handleClient, clientSocket);
-        t.detach();
-    }
-
-    closesocket(serverSocket);
-    WSACleanup();
+[STAThreadAttribute]
+int main(cli::array<System::String^>^ args) {
+    Application::EnableVisualStyles();
+    Application::SetCompatibleTextRenderingDefault(false);
+    Application::Run(gcnew ServerForm());
+    return 0;
 }

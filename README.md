@@ -11,38 +11,38 @@ Toàn bộ các chức năng của chương trình được thực hiện thông
 
 ## Cấu trúc dự án
 
-Ở **thư mục gốc** repo chỉ giữ đúng các phần chính (đúng format bản gốc):
-
-* **Code:** Mã nguồn chương trình *(CMake, preset VS Code, `.clangd` nằm trong `Code/`)*  
-* **DOCX:** Báo cáo dự án  
-* **PPTX:** Slide thuyết trình  
-* **Extra:** Hình ảnh và tài liệu bổ sung  
-
-*(Ngoài ra có `.gitignore` chuẩn Git ở gốc.)*
+```
+MyProjectClone/
+├── Code/                   ← Mã nguồn chương trình
+│   ├── Client/             ← Mã nguồn Client (GUI WinForms)
+│   │   └── client.cpp
+│   ├── Server/             ← Mã nguồn Server (GUI WinForms)
+│   │   └── server.cpp
+│   ├── Shared/             ← Thư viện dùng chung (Protocol)
+│   │   ├── Protocol.h
+│   │   └── Protocol.cpp
+│   ├── CMakeLists.txt
+│   └── CMakePresets.json
+├── DOCX/                   ← Báo cáo dự án (Word DOC/DOCX)
+├── Extra/                  ← Tài liệu bổ sung, hình ảnh, proof
+├── PPTX/                   ← Slide thuyết trình (PowerPoint PPT/PPTX)
+├── README.md
+└── .gitignore
+```
 
 ## Yêu cầu & build (Windows)
 
-Dự án dùng **Winsock** — chỉ build trên **Windows**.
+Dự án dùng **Winsock + C++/CLI WinForms** — chỉ build trên **Windows** với **MSVC**.
 
-Cần cài: **CMake** (≥ 3.16) và một trong các bộ compiler sau:
-
-* **Visual Studio 2022** (workload *Desktop development with C++*), hoặc
-* **MSYS2 / MinGW-w64** (g++, thường kèm **Ninja**).
+Cần cài: **CMake** (≥ 3.16) và **Visual Studio 2022** (workload *Desktop development with C++*).
 
 **Quan trọng:** *File → Open → Folder…* phải mở thư mục **`Code`** (nơi có `CMakeLists.txt`), **không** mở cả repo gốc nếu bạn dùng CMake trong Visual Studio / VS Code.
 
 ### Visual Studio
 
 1. *File → Open → Folder…* → chọn thư mục **`Code`**.
-2. Visual Studio nhận CMake; chọn target **server**, **client** hoặc **protocol_demo** rồi *Build*.
-3. Chạy: `server.exe` / `client.exe` trong `Code/build/...` (ví dụ `Debug/` hoặc `Release/` tùy generator).
-
-### Visual Studio Code
-
-1. *File → Open Folder…* → chọn thư mục **`Code`**.
-2. Cài **CMake Tools** và **C/C++** (gợi ý trong `Code/.vscode/extensions.json`).
-3. Chọn preset **vs2022** hoặc **ninja** (`Code/CMakePresets.json`), *kit*, *Build*, *Launch Target*.
-4. Clangd: sau khi configure, dùng `Code/build/compile_commands.json` (`.clangd` trong `Code/`).
+2. Visual Studio nhận CMake; chọn target **server** hoặc **client** rồi *Build*.
+3. Chạy: `server.exe` / `client.exe` trong `Code/build/...`.
 
 ### Dòng lệnh (CMake)
 
@@ -54,17 +54,9 @@ cmake --preset vs2022
 cmake --build build --config Release
 ```
 
-Hoặc Ninja + MinGW:
-
-```text
-cd Code
-cmake --preset ninja
-cmake --build build
-```
-
-File thực thi nằm trong `Code/build/` (Ninja) hoặc `Code/build/Release|Debug/` (generator Visual Studio).
+File thực thi nằm trong `Code/build/Release|Debug/`.
 
 ### Chạy thử
 
-1. Terminal 1: chạy **server** (lắng nghe cổng trong `Code/Shared/Protocol.h`, mặc định **9050**).
-2. Terminal 2: chạy **client**, nhập tin nhắn.
+1. Terminal 1: chạy **server** — lắng nghe cổng mặc định **9050**, tự phát hiện LAN qua UDP **9051**.
+2. Terminal 2: chạy **client**, nhập tên hiển thị và kết nối. Client tự tìm server trong LAN.
